@@ -15,10 +15,13 @@ import (
 	"github.com/nspcc-dev/neo-go/pkg/crypto/keys"
 	"github.com/nspcc-dev/neo-go/pkg/encoding/fixedn"
 	"github.com/nspcc-dev/neo-go/pkg/neorpc"
+	"github.com/nspcc-dev/neo-go/pkg/neorpc/result"
+	"github.com/nspcc-dev/neo-go/pkg/rpcclient/actor"
 	"github.com/nspcc-dev/neo-go/pkg/rpcclient/notary"
 	sc "github.com/nspcc-dev/neo-go/pkg/smartcontract"
 	"github.com/nspcc-dev/neo-go/pkg/util"
 	"github.com/nspcc-dev/neo-go/pkg/vm/opcode"
+	"github.com/nspcc-dev/neo-go/pkg/vm/vmstate"
 	"github.com/nspcc-dev/neo-go/pkg/wallet"
 	"github.com/nspcc-dev/neofs-node/pkg/util/rand"
 	"go.uber.org/zap"
@@ -457,34 +460,6 @@ func (c *Client) notaryInvoke(committee, invokedByAlpha bool, contract util.Uint
 		return err
 	}
 
-	params, err := invocationParams(args...)
-	if err != nil {
-		return err
-	}
-
-	// make test invocation of the method
-	test, err := c.client.InvokeFunction(contract, method, params, cosigners)
-	if err != nil {
-		return err
-	}
-
-	// check invocation state
-	if test.State != HaltState {
-		return wrapNeoFSError(&notHaltStateError{state: test.State, exception: test.FaultException})
-	}
-
-	// if test invocation failed, then return error
-	if len(test.Script) == 0 {
-		return wrapNeoFSError(errEmptyInvocationScript)
-	}
-
-	// after test invocation we build main multisig transaction
-
-	multiaddrAccount, err := c.notaryMultisigAccount(alphabetList, committee, invokedByAlpha)
-	if err != nil {
-		return err
-	}
-
 	var until uint32
 
 	if vub != nil {
@@ -496,47 +471,21 @@ func (c *Client) notaryInvoke(committee, invokedByAlpha bool, contract util.Uint
 		}
 	}
 
-	// prepare main tx
-	mainTx := &transaction.Transaction{
-		Nonce:           nonce,
-		SystemFee:       test.GasConsumed,
-		ValidUntilBlock: until,
-		Script:          test.Script,
-		Attributes: []transaction.Attribute{
-			{
-				Type:  transaction.NotaryAssistedT,
-				Value: &transaction.NotaryAssisted{NKeys: u8n},
-			},
-		},
-		Signers: cosigners,
-	}
-
-	// calculate notary fee
-	notaryFee, err := c.client.CalculateNotaryFee(u8n)
+	nAct, err := notary.NewActor(c.client, cosigners, c.acc)
 	if err != nil {
 		return err
 	}
 
-	// add network fee for cosigners
-	//nolint:staticcheck // waits for neo-go v0.99.3 with notary actors
-	err = c.client.AddNetworkFee(
-		mainTx,
-		notaryFee,
-		c.notaryAccounts(invokedByAlpha, multiaddrAccount)...,
-	)
-	if err != nil {
-		return err
-	}
+	h, _, _, err := nAct.Notarize(nAct.MakeTunedCall(contract, method, nil, func(r *result.Invoke, t *transaction.Transaction) error {
+		if r.State != vmstate.Halt.String() {
+			return wrapNeoFSError(&notHaltStateError{state: r.State, exception: r.FaultException})
+		}
 
-	// define witnesses
-	mainTx.Scripts = c.notaryWitnesses(invokedByAlpha, multiaddrAccount, mainTx)
+		t.ValidUntilBlock = until
+		t.Nonce = nonce
 
-	resp, err := c.client.SignAndPushP2PNotaryRequest(mainTx,
-		[]byte{byte(opcode.RET)},
-		-1,
-		0,
-		c.notary.fallbackTime,
-		c.acc)
+		return nil
+	}, args...))
 	if err != nil && !alreadyOnChainError(err) {
 		return err
 	}
@@ -545,53 +494,53 @@ func (c *Client) notaryInvoke(committee, invokedByAlpha bool, contract util.Uint
 		zap.String("method", method),
 		zap.Uint32("valid_until_block", until),
 		zap.Uint32("fallback_valid_for", c.notary.fallbackTime),
-		zap.Stringer("tx_hash", resp.Hash().Reverse()))
+		zap.Stringer("tx_hash", h.Reverse()))
 
 	return nil
 }
 
-func (c *Client) notaryCosigners(invokedByAlpha bool, ir []*keys.PublicKey, committee bool) ([]transaction.Signer, error) {
-	s := make([]transaction.Signer, 0, 4)
-
-	// first we have proxy contract signature, as it will pay for the execution
-	s = append(s, transaction.Signer{
-		Account: c.notary.proxy,
-		Scopes:  transaction.None,
-	})
-
-	// then we have inner ring multiaddress signature
-	m := sigCount(ir, committee)
-
-	multisigScript, err := sc.CreateMultiSigRedeemScript(m, ir)
+func (c *Client) notaryCosigners(invokedByAlpha bool, ir []*keys.PublicKey, committee bool) ([]actor.SignerAccount, error) {
+	multiaddrAccount, err := c.notaryMultisigAccount(ir, committee, invokedByAlpha)
 	if err != nil {
-		// wrap error as NeoFS-specific since the call is not related to any client
-		return nil, wrapNeoFSError(fmt.Errorf("can't create ir multisig redeem script: %w", err))
+		return nil, err
 	}
 
-	s = append(s, transaction.Signer{
-		Account:          hash.Hash160(multisigScript),
-		Scopes:           c.cfg.signer.Scopes,
-		AllowedContracts: c.cfg.signer.AllowedContracts,
-		AllowedGroups:    c.cfg.signer.AllowedGroups,
-	})
+	ss := make([]actor.SignerAccount, 0, 3)
+	ss = append(ss, []actor.SignerAccount{
+		{
+			// proxy contract
+			Signer: transaction.Signer{
+				Account: c.notary.proxy,
+				Scopes:  transaction.None,
+			},
+			Account: notary.FakeContractAccount(c.notary.proxy),
+		},
+		{
+			// multi signature
+			Signer: transaction.Signer{
+				Account:          multiaddrAccount.ScriptHash(),
+				Scopes:           c.cfg.signer.Scopes,
+				AllowedContracts: c.cfg.signer.AllowedContracts,
+				AllowedGroups:    c.cfg.signer.AllowedGroups,
+			},
+			Account: multiaddrAccount,
+		},
+	}...)
 
 	if !invokedByAlpha {
-		// then we have invoker signature
-		s = append(s, transaction.Signer{
-			Account:          hash.Hash160(c.acc.GetVerificationScript()),
-			Scopes:           c.cfg.signer.Scopes,
-			AllowedContracts: c.cfg.signer.AllowedContracts,
-			AllowedGroups:    c.cfg.signer.AllowedGroups,
+		// invoker signature
+		ss = append(ss, actor.SignerAccount{
+			Signer: transaction.Signer{
+				Account:          hash.Hash160(c.acc.GetVerificationScript()),
+				Scopes:           c.cfg.signer.Scopes,
+				AllowedContracts: c.cfg.signer.AllowedContracts,
+				AllowedGroups:    c.cfg.signer.AllowedGroups,
+			},
+			Account: c.acc,
 		})
 	}
 
-	// last one is a placeholder for notary contract signature
-	s = append(s, transaction.Signer{
-		Account: c.notary.notary,
-		Scopes:  transaction.None,
-	})
-
-	return s, nil
+	return ss, nil
 }
 
 func (c *Client) notaryAccounts(invokedByAlpha bool, multiaddr *wallet.Account) []*wallet.Account {
